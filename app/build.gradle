@@ -15,8 +15,28 @@ android {
         applicationId "com.veltrix.tv"
         minSdk 21
         targetSdk 34
-        versionCode 58
-        versionName "5.4"
+        versionCode 59
+        versionName "5.5"
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    flavorDimensions "brand"
+    productFlavors {
+        veltrix {
+            dimension "brand"
+            applicationId "com.veltrix.tv"
+            resValue "string", "app_name", "Veltrix TV"
+            buildConfigField "String", "BRAND", "\"VeltrixTV\""
+        }
+        mediacorner {
+            dimension "brand"
+            applicationId "com.mediacorner.tv"
+            resValue "string", "app_name", "MediaCorner"
+            buildConfigField "String", "BRAND", "\"MediaCorner\""
+        }
     }
 
     buildTypes {

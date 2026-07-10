@@ -524,12 +524,12 @@ class PlaybackActivity : AppCompatActivity() {
      */
     private fun checkForStall() {
         val p = player ?: return
-        if (isSettingsOpen || isReconnecting) {
-            lastAdvanceTime = System.currentTimeMillis()
-            return
-        }
-        // Only meaningful when we actually want to play and have media ready.
-        if (!p.playWhenReady || p.playbackState != Player.STATE_READY) {
+        // Reset the stall timer only when we're not trying to play (settings,
+        // a planned reconnect, or paused). We deliberately DO NOT reset it just
+        // because the state dipped to BUFFERING - on a mid-stream format change
+        // the pipeline flaps BUFFERING<->READY with the position frozen, and the
+        // old code reset the timer on every dip so the stall was never caught.
+        if (isSettingsOpen || isReconnecting || !p.playWhenReady) {
             lastKnownPosition = p.currentPosition
             lastAdvanceTime = System.currentTimeMillis()
             return
@@ -541,7 +541,7 @@ class PlaybackActivity : AppCompatActivity() {
             lastKnownPosition = pos
             lastAdvanceTime = now
         } else if (now - lastAdvanceTime > STALL_TIMEOUT_MS) {
-            Log.w(TAG, "Playback stalled (position frozen at ${pos}ms) - auto reloading")
+            Log.w(TAG, "Playback stalled (position frozen at ${pos}ms, state=${p.playbackState}) - auto reloading")
             lastAdvanceTime = now
             fullRestartPlayback()
         }
@@ -631,7 +631,7 @@ class PlaybackActivity : AppCompatActivity() {
     private fun buildDebugText(): String {
         val p = player
         val sb = StringBuilder()
-        sb.append("VeltrixTV v5.4  (D-pad Down to hide)\n")
+        sb.append("${BuildConfig.BRAND} v${BuildConfig.VERSION_NAME}  (D-pad Down to hide)\n")
 
         if (p == null) {
             sb.append("player: null\n")
