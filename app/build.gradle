@@ -11,8 +11,8 @@ android {
         applicationId "com.veltrix.tv"
         minSdk 21
         targetSdk 34
-        versionCode 53
-        versionName "3.4"
+        versionCode 54
+        versionName "5.0"
     }
 
     buildTypes {
@@ -43,12 +43,17 @@ dependencies {
     implementation 'androidx.leanback:leanback:1.0.0'
     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
 
-    // ExoPlayer (built-in data sources only - the proven stable v3.3 engine)
+    // ExoPlayer (same stack as the stable StreamPlayer v3.2 build)
     implementation 'androidx.media3:media3-exoplayer:1.2.1'
     implementation 'androidx.media3:media3-exoplayer-hls:1.2.1'
-    implementation 'androidx.media3:media3-exoplayer-rtsp:1.2.1'
     implementation 'androidx.media3:media3-ui:1.2.1'
     implementation 'androidx.media3:media3-datasource:1.2.1'
-    implementation 'androidx.media3:media3-datasource-okhttp:1.2.1'
     implementation 'androidx.media3:media3-common:1.2.1'
+    implementation 'androidx.media3:media3-extractor:1.2.1'
+
+    // SRT protocol support (native, via srtdroid - required to play the stream)
+    implementation 'io.github.thibaultbee.srtdroid:srtdroid-core:1.9.1'
+
+    // RTMP protocol support
+    implementation 'androidx.media3:media3-datasource-rtmp:1.2.1'
 }
