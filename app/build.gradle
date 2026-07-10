@@ -11,8 +11,8 @@ android {
         applicationId "com.veltrix.tv"
         minSdk 21
         targetSdk 34
-        versionCode 33
-        versionName "3.3"
+        versionCode 53
+        versionName "3.4"
     }
 
     buildTypes {
@@ -43,14 +43,12 @@ dependencies {
     implementation 'androidx.leanback:leanback:1.0.0'
     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
 
-    // ExoPlayer
+    // ExoPlayer (built-in data sources only - the proven stable v3.3 engine)
     implementation 'androidx.media3:media3-exoplayer:1.2.1'
     implementation 'androidx.media3:media3-exoplayer-hls:1.2.1'
     implementation 'androidx.media3:media3-exoplayer-rtsp:1.2.1'
     implementation 'androidx.media3:media3-ui:1.2.1'
     implementation 'androidx.media3:media3-datasource:1.2.1'
-    implementation 'androidx.media3:media3-common:1.2.1'
-
-    // SRT support via FFmpeg extension
     implementation 'androidx.media3:media3-datasource-okhttp:1.2.1'
+    implementation 'androidx.media3:media3-common:1.2.1'
 }

@@ -23,7 +23,6 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
-import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.ui.PlayerView
 import java.io.BufferedReader
 import java.io.File
@@ -71,6 +70,14 @@ class PlaybackActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Safety net: if anything ever crashes, relaunch ourselves instead of
+        // dropping the box out to another launcher.
+        Thread.setDefaultUncaughtExceptionHandler { _, throwable ->
+            Log.e(TAG, "Uncaught exception, restarting: ${throwable.message}", throwable)
+            try { restartApp() } catch (_: Exception) {}
+        }
+
         setContentView(R.layout.activity_playback)
 
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -83,7 +90,7 @@ class PlaybackActivity : AppCompatActivity() {
         if (streamUrl.isNotEmpty()) {
             startPlayback()
         } else {
-            showStatus("No stream configured. Press MENU to open settings.")
+            showConfigPrompt("No stream configured. Press MENU to open settings.")
         }
     }
 
@@ -100,6 +107,15 @@ class PlaybackActivity : AppCompatActivity() {
             KeyEvent.KEYCODE_BACK -> {
                 if (!isSettingsOpen) {
                     showPinDialog()
+                }
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_UP -> {
+                // Manual reset shortcut: force a clean restart of playback.
+                if (!isSettingsOpen) {
+                    consecutiveReconnectFailures = 0
+                    currentAdaptiveBufferMultiplier = 1
+                    fullRestartPlayback()
                 }
                 return true
             }
@@ -163,7 +179,7 @@ class PlaybackActivity : AppCompatActivity() {
             setText(currentUrl)
             setTextColor(0xFFFFFFFF.toInt())
             setHintTextColor(0xFF888888.toInt())
-            hint = "srt://host:port or rtmp://... or http://..."
+            hint = "http://... or .m3u8 or rtsp://..."
             isSingleLine = true
         }
 
@@ -313,11 +329,11 @@ class PlaybackActivity : AppCompatActivity() {
     private fun startPlayback() {
         val streamUrl = prefs.getString(KEY_STREAM_URL, "") ?: ""
         if (streamUrl.isEmpty()) {
-            showStatus("No stream URL configured")
+            showConfigPrompt("No stream URL configured")
             return
         }
 
-        showStatus("Connecting...")
+        hideStatus()
         releasePlayer()
         initializePlayer(streamUrl)
     }
@@ -327,7 +343,7 @@ class PlaybackActivity : AppCompatActivity() {
         val maxBufferMs = 30000 * currentAdaptiveBufferMultiplier
         val playbackBufferMs = 2500 * currentAdaptiveBufferMultiplier
 
-        Log.d(TAG, "Initializing player with adaptive buffer: min=${bufferMs}ms, max=${maxBufferMs}ms, playback=${playbackBufferMs}ms (multiplier=$currentAdaptiveBufferMultiplier)")
+        Log.d(TAG, "Initializing player, adaptive buffer min=$bufferMs max=$maxBufferMs playback=$playbackBufferMs (x$currentAdaptiveBufferMultiplier)")
 
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
@@ -356,15 +372,19 @@ class PlaybackActivity : AppCompatActivity() {
 
                 val mediaItemBuilder = MediaItem.Builder().setUri(streamUrl)
 
-                if (streamUrl.contains("srt://", ignoreCase = true)) {
+                if (streamUrl.contains("srt://", ignoreCase = true) ||
+                    streamUrl.endsWith(".ts", ignoreCase = true)) {
                     mediaItemBuilder.setMimeType(MimeTypes.VIDEO_MP2T)
                 }
 
                 if (isLikelyLiveStream(streamUrl)) {
+                    // Audio-sync approach from the newer builds: keep playback at
+                    // true 1.0x speed (no pitch-shifting speed correction) and
+                    // instead seek back to the live edge when drift builds up.
                     mediaItemBuilder.setLiveConfiguration(
                         MediaItem.LiveConfiguration.Builder()
-                            .setMaxPlaybackSpeed(1.04f)
-                            .setMinPlaybackSpeed(0.96f)
+                            .setMaxPlaybackSpeed(1.0f)
+                            .setMinPlaybackSpeed(1.0f)
                             .setMaxOffsetMs(8000L * currentAdaptiveBufferMultiplier)
                             .setMinOffsetMs(3000L)
                             .setTargetOffsetMs(5000L)
@@ -384,6 +404,7 @@ class PlaybackActivity : AppCompatActivity() {
     private fun isLikelyLiveStream(url: String): Boolean {
         return url.contains("srt://", ignoreCase = true) ||
                 url.contains("rtmp://", ignoreCase = true) ||
+                url.contains("rtsp://", ignoreCase = true) ||
                 url.contains(".m3u8", ignoreCase = true)
     }
 
@@ -395,7 +416,6 @@ class PlaybackActivity : AppCompatActivity() {
                         isBuffering = true
                         bufferingStartTime = System.currentTimeMillis()
                     }
-                    showStatus("Buffering...")
                 }
                 Player.STATE_READY -> {
                     isBuffering = false
@@ -404,7 +424,6 @@ class PlaybackActivity : AppCompatActivity() {
                     hideStatus()
                 }
                 Player.STATE_ENDED -> {
-                    showStatus("Stream ended. Reconnecting...")
                     scheduleReconnect()
                 }
                 Player.STATE_IDLE -> {
@@ -419,17 +438,11 @@ class PlaybackActivity : AppCompatActivity() {
                 isBuffering = false
                 bufferingStartTime = 0
                 hideStatus()
-                player?.let {
-                    if (it.playbackParameters.speed != 1.0f) {
-                        it.playbackParameters = PlaybackParameters(1.0f)
-                    }
-                }
             }
         }
 
         override fun onPlayerError(error: PlaybackException) {
             Log.e(TAG, "Player error: ${error.message}")
-            showStatus("Connection error. Reconnecting...")
             scheduleReconnect()
         }
     }
@@ -442,14 +455,12 @@ class PlaybackActivity : AppCompatActivity() {
 
         if (consecutiveReconnectFailures >= MAX_RECONNECT_BEFORE_RESTART) {
             Log.w(TAG, "Max reconnect attempts reached, restarting app")
-            showStatus("Restarting app...")
             handler.postDelayed({ restartApp() }, 1000)
             return
         }
 
         handler.postDelayed({
             if (!isSettingsOpen) {
-                showStatus("Reconnecting (attempt $consecutiveReconnectFailures)...")
                 fullRestartPlayback()
             }
         }, RECONNECT_DELAY_MS)
@@ -501,16 +512,9 @@ class PlaybackActivity : AppCompatActivity() {
         if (p.isCurrentMediaItemLive) {
             val liveOffset = p.currentLiveOffset
             if (liveOffset > MAX_DRIFT_MS) {
-                Log.d(TAG, "Live drift detected: ${liveOffset}ms, seeking to live edge")
-                showStatus("Syncing...")
+                Log.d(TAG, "Live drift ${liveOffset}ms, seeking to live edge")
                 p.seekToDefaultPosition()
-                handler.postDelayed({ hideStatus() }, 2000)
             }
-        }
-
-        if (p.playbackParameters.speed != 1.0f) {
-            Log.d(TAG, "Speed drift: ${p.playbackParameters.speed}, resetting to 1.0")
-            p.playbackParameters = PlaybackParameters(1.0f)
         }
     }
 
@@ -540,12 +544,11 @@ class PlaybackActivity : AppCompatActivity() {
 
         if (isBuffering && bufferingStartTime > 0) {
             val bufferingDuration = System.currentTimeMillis() - bufferingStartTime
-            Log.d(TAG, "Buffering for ${bufferingDuration}ms (adaptive multiplier=$currentAdaptiveBufferMultiplier)")
+            Log.d(TAG, "Buffering ${bufferingDuration}ms (x$currentAdaptiveBufferMultiplier)")
 
             if (bufferingDuration > MAX_BUFFERING_TIME_MS) {
+                // Network has been rough for a while: grow the buffer and restart clean.
                 Log.w(TAG, "Stuck buffering, increasing buffer and restarting")
-                showStatus("Adjusting buffer...")
-
                 if (currentAdaptiveBufferMultiplier < 4) {
                     currentAdaptiveBufferMultiplier++
                 }
@@ -555,9 +558,11 @@ class PlaybackActivity : AppCompatActivity() {
             }
         }
 
-        if (!isNetworkAvailable() && p.playbackState != Player.STATE_IDLE) {
-            Log.w(TAG, "Network lost, will retry when available")
-            showStatus("No network. Waiting...")
+        // If the player has gone idle (stream/network dropped) and did not come
+        // back on its own, kick a reconnect so we always recover.
+        if (p.playbackState == Player.STATE_IDLE) {
+            Log.w(TAG, "Player idle in watchdog, scheduling reconnect")
+            scheduleReconnect()
         }
     }
 
@@ -569,8 +574,10 @@ class PlaybackActivity : AppCompatActivity() {
     }
 
     // --- UI helpers ---
+    // Transient playback status ("Buffering", "Reconnecting", "Syncing", etc.)
+    // is intentionally NOT shown on screen. Only the initial config prompt uses this.
 
-    private fun showStatus(message: String) {
+    private fun showConfigPrompt(message: String) {
         runOnUiThread {
             statusText.text = message
             statusText.visibility = View.VISIBLE
