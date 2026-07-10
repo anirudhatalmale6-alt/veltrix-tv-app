@@ -22,8 +22,12 @@ import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.rtmp.RtmpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.SeekParameters
+import androidx.media3.exoplayer.audio.AudioCapabilities
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
@@ -65,6 +69,12 @@ class PlaybackActivity : AppCompatActivity() {
         private const val MAX_BUFFERING_TIME_MS = 60000L
         private const val MAX_DRIFT_THRESHOLD_MS = 3000L
 
+        // Stall detection: if the player claims to be playing but its position
+        // stops advancing (e.g. the source stream changes audio/video format
+        // mid-stream), auto reload playback instead of freezing.
+        private const val STALL_CHECK_INTERVAL_MS = 4000L
+        private const val STALL_TIMEOUT_MS = 12000L
+
         // Base buffer sizes (multiplied by the adaptive multiplier).
         private const val BASE_MIN_BUFFER_MS = 15000
         private const val BASE_MAX_BUFFER_MS = 30000
@@ -90,7 +100,18 @@ class PlaybackActivity : AppCompatActivity() {
     private var bufferMultiplier = 1
     private var hasPlayed = false
 
+    // Stall detection state.
+    private var lastKnownPosition = 0L
+    private var lastAdvanceTime = 0L
+
     private val retryRunnable = Runnable { fullRestartPlayback() }
+
+    private val stallCheckRunnable = object : Runnable {
+        override fun run() {
+            checkForStall()
+            handler.postDelayed(this, STALL_CHECK_INTERVAL_MS)
+        }
+    }
 
     private val syncCheckRunnable = object : Runnable {
         override fun run() {
@@ -207,7 +228,25 @@ class PlaybackActivity : AppCompatActivity() {
             .setBackBuffer(10000, true)
             .build()
 
-        val exo = ExoPlayer.Builder(this)
+        // Force all audio to be decoded to PCM instead of passing Dolby/AC3
+        // through to the TV. Giving the audio sink PCM-only capabilities makes
+        // ExoPlayer decode AC3/E-AC3 natively (via the platform decoder) down to
+        // PCM, so the TV no longer reports Dolby. Decoder fallback also helps the
+        // player recover from a mid-stream codec/format change.
+        val renderersFactory = object : DefaultRenderersFactory(this) {
+            override fun buildAudioSink(
+                context: Context,
+                enableFloatOutput: Boolean,
+                enableAudioTrackPlaybackParams: Boolean
+            ): AudioSink {
+                return DefaultAudioSink.Builder(context)
+                    .setAudioCapabilities(AudioCapabilities.DEFAULT_AUDIO_CAPABILITIES)
+                    .setEnableFloatOutput(enableFloatOutput)
+                    .build()
+            }
+        }.setEnableDecoderFallback(true)
+
+        val exo = ExoPlayer.Builder(this, renderersFactory)
             .setLoadControl(loadControl)
             .build().apply {
                 playWhenReady = true
@@ -314,6 +353,8 @@ class PlaybackActivity : AppCompatActivity() {
                 isReconnecting = false
                 retryAttempts = 0
                 currentRetryDelay = INITIAL_RETRY_DELAY_MS
+                lastKnownPosition = player?.currentPosition ?: 0L
+                lastAdvanceTime = System.currentTimeMillis()
                 hideStatus()
                 startSyncChecking()
             } else {
@@ -374,10 +415,46 @@ class PlaybackActivity : AppCompatActivity() {
     private fun startWatchdog() {
         handler.removeCallbacks(watchdogRunnable)
         handler.postDelayed(watchdogRunnable, WATCHDOG_INTERVAL_MS)
+        lastKnownPosition = 0L
+        lastAdvanceTime = System.currentTimeMillis()
+        handler.removeCallbacks(stallCheckRunnable)
+        handler.postDelayed(stallCheckRunnable, STALL_CHECK_INTERVAL_MS)
     }
 
     private fun stopWatchdog() {
         handler.removeCallbacks(watchdogRunnable)
+        handler.removeCallbacks(stallCheckRunnable)
+    }
+
+    /**
+     * Detects a "playing but frozen" stall - the case where the source stream
+     * changes format mid-stream and the player wedges without reporting an
+     * error or going idle. When the position stops advancing while we expect
+     * playback, reload the stream automatically (same as a D-pad Up reset).
+     */
+    private fun checkForStall() {
+        val p = player ?: return
+        if (isSettingsOpen || isReconnecting) {
+            lastAdvanceTime = System.currentTimeMillis()
+            return
+        }
+        // Only meaningful when we actually want to play and have media ready.
+        if (!p.playWhenReady || p.playbackState != Player.STATE_READY) {
+            lastKnownPosition = p.currentPosition
+            lastAdvanceTime = System.currentTimeMillis()
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        val pos = p.currentPosition
+        if (pos > lastKnownPosition + 100) {
+            lastKnownPosition = pos
+            lastAdvanceTime = now
+        } else if (now - lastAdvanceTime > STALL_TIMEOUT_MS) {
+            Log.w(TAG, "Playback stalled (position frozen at ${pos}ms) - auto reloading")
+            lastAdvanceTime = now
+            fullRestartPlayback()
+        }
     }
 
     private fun checkPlayerHealth() {
