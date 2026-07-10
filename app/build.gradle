@@ -3,6 +3,10 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
+repositories {
+    flatDir { dirs 'libs' }
+}
+
 android {
     namespace 'com.veltrix.tv'
     compileSdk 34
@@ -11,8 +15,8 @@ android {
         applicationId "com.veltrix.tv"
         minSdk 21
         targetSdk 34
-        versionCode 56
-        versionName "5.2"
+        versionCode 57
+        versionName "5.3"
     }
 
     buildTypes {
@@ -56,4 +60,9 @@ dependencies {
 
     // RTMP protocol support
     implementation 'androidx.media3:media3-datasource-rtmp:1.2.1'
+
+    // FFmpeg audio decoder extension (built from media3 1.2.1 source with
+    // AC3/E-AC3/AAC/MP3 enabled). Decodes audio to PCM in software so Dolby is
+    // NOT passed through to the TV on Amlogic boxes.
+    implementation(name: 'media3-decoder-ffmpeg-1.2.1', ext: 'aar')
 }

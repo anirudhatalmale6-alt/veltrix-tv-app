@@ -228,11 +228,15 @@ class PlaybackActivity : AppCompatActivity() {
             .setBackBuffer(10000, true)
             .build()
 
-        // Force all audio to be decoded to PCM instead of passing Dolby/AC3
-        // through to the TV. Giving the audio sink PCM-only capabilities makes
-        // ExoPlayer decode AC3/E-AC3 natively (via the platform decoder) down to
-        // PCM, so the TV no longer reports Dolby. Decoder fallback also helps the
-        // player recover from a mid-stream codec/format change.
+        // Force all audio to real PCM instead of passing Dolby/AC3 through to
+        // the TV. Two layers:
+        //  1) Prefer the bundled FFmpeg software decoder (EXTENSION_RENDERER_MODE
+        //     _PREFER) - it decodes AC3/E-AC3/AAC/MP3 to PCM entirely in software,
+        //     so the Amlogic hardware passthrough decoder is never used. This is
+        //     what actually stops the TV from seeing Dolby.
+        //  2) Give the audio sink PCM-only capabilities as a backstop so nothing
+        //     can fall back to passthrough.
+        // Decoder fallback also helps recover from a mid-stream codec change.
         val renderersFactory = object : DefaultRenderersFactory(this) {
             override fun buildAudioSink(
                 context: Context,
@@ -244,7 +248,8 @@ class PlaybackActivity : AppCompatActivity() {
                     .setEnableFloatOutput(enableFloatOutput)
                     .build()
             }
-        }.setEnableDecoderFallback(true)
+        }.setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
+            .setEnableDecoderFallback(true)
 
         val exo = ExoPlayer.Builder(this, renderersFactory)
             .setLoadControl(loadControl)
