@@ -3,12 +3,14 @@ package com.veltrix.tv
 import android.app.AlertDialog
 import android.content.Context
 import android.content.SharedPreferences
+import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
 import android.util.Log
+import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.widget.*
@@ -25,6 +27,7 @@ import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.SeekParameters
+import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.audio.AudioCapabilities
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
@@ -67,7 +70,13 @@ class PlaybackActivity : AppCompatActivity() {
         private const val WATCHDOG_INTERVAL_MS = 10000L
         private const val SYNC_CHECK_INTERVAL_MS = 30000L
         private const val MAX_BUFFERING_TIME_MS = 60000L
-        private const val MAX_DRIFT_THRESHOLD_MS = 3000L
+
+        // Live re-sync: only trim latency when the buffered-ahead is genuinely
+        // excessive, and always leave a healthy buffer behind. The old 3s
+        // threshold + seek-to-1s fought the adaptive buffer growth and produced
+        // a stop/jump-to-live cycle, worse on streams whose buffer had grown.
+        private const val LIVE_RESYNC_THRESHOLD_MS = 45000L
+        private const val RESYNC_KEEP_BUFFER_MS = 8000L
 
         // Stall detection: if the player claims to be playing but its position
         // stops advancing (e.g. the source stream changes audio/video format
@@ -80,7 +89,7 @@ class PlaybackActivity : AppCompatActivity() {
         private const val BASE_MAX_BUFFER_MS = 30000
         private const val BASE_BUFFER_FOR_PLAYBACK_MS = 3000
         private const val BASE_BUFFER_AFTER_REBUFFER_MS = 5000
-        private const val MAX_BUFFER_MULTIPLIER = 4
+        private const val MAX_BUFFER_MULTIPLIER = 3
     }
 
     private var player: ExoPlayer? = null
@@ -104,7 +113,56 @@ class PlaybackActivity : AppCompatActivity() {
     private var lastKnownPosition = 0L
     private var lastAdvanceTime = 0L
 
+    // Debug overlay (toggle with D-pad Down).
+    private lateinit var debugText: TextView
+    private var debugVisible = false
+    private var bufferingEvents = 0
+    private var restartEvents = 0
+    private var audioUnderruns = 0
+    private var droppedFrames = 0
+    private var audioDecoderName = "-"
+    private var videoDecoderName = "-"
+    private var lastEvent = "-"
+
     private val retryRunnable = Runnable { fullRestartPlayback() }
+
+    private val analyticsListener = object : AnalyticsListener {
+        override fun onAudioDecoderInitialized(
+            eventTime: AnalyticsListener.EventTime,
+            decoderName: String,
+            initializedTimestampMs: Long,
+            initializationDurationMs: Long
+        ) { audioDecoderName = decoderName }
+
+        override fun onVideoDecoderInitialized(
+            eventTime: AnalyticsListener.EventTime,
+            decoderName: String,
+            initializedTimestampMs: Long,
+            initializationDurationMs: Long
+        ) { videoDecoderName = decoderName }
+
+        override fun onDroppedVideoFrames(
+            eventTime: AnalyticsListener.EventTime,
+            droppedFrames: Int,
+            elapsedMs: Long
+        ) { this@PlaybackActivity.droppedFrames += droppedFrames }
+
+        override fun onAudioUnderrun(
+            eventTime: AnalyticsListener.EventTime,
+            bufferSize: Int,
+            bufferSizeMs: Long,
+            elapsedSinceLastFeedMs: Long
+        ) { audioUnderruns++ }
+    }
+
+    private val debugRunnable = object : Runnable {
+        override fun run() {
+            if (debugVisible) {
+                debugText.text = buildDebugText()
+                handler.postDelayed(this, 1000L)
+            }
+        }
+    }
 
     private val stallCheckRunnable = object : Runnable {
         override fun run() {
@@ -159,6 +217,23 @@ class PlaybackActivity : AppCompatActivity() {
         statusText = findViewById(R.id.status_text)
         playerView.useController = false
 
+        // Debug overlay - hidden until toggled with D-pad Down.
+        debugText = TextView(this).apply {
+            setTextColor(0xFFFFFFFF.toInt())
+            setBackgroundColor(0x99000000.toInt())
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            setPadding(16, 16, 16, 16)
+            visibility = View.GONE
+        }
+        addContentView(
+            debugText,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            ).apply { gravity = Gravity.TOP or Gravity.START }
+        )
+
         PlaybackService.start(this)
     }
 
@@ -204,6 +279,11 @@ class PlaybackActivity : AppCompatActivity() {
                     bufferMultiplier = 1
                     fullRestartPlayback()
                 }
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_DOWN -> {
+                // Toggle the debug stats overlay.
+                if (!isSettingsOpen) toggleDebugOverlay()
                 return true
             }
         }
@@ -258,6 +338,7 @@ class PlaybackActivity : AppCompatActivity() {
                 repeatMode = Player.REPEAT_MODE_OFF
                 setSeekParameters(SeekParameters.CLOSEST_SYNC)
                 addListener(playerListener)
+                addAnalyticsListener(analyticsListener)
             }
         player = exo
         playerView.player = exo
@@ -332,6 +413,7 @@ class PlaybackActivity : AppCompatActivity() {
                 Player.STATE_BUFFERING -> {
                     if (bufferingStartTime == 0L) {
                         bufferingStartTime = System.currentTimeMillis()
+                        if (hasPlayed) { bufferingEvents++; lastEvent = "buffering" }
                     }
                     // A real underrun (already played, not a planned reconnect)
                     // means the network is rough: grow the buffer for next init.
@@ -400,6 +482,8 @@ class PlaybackActivity : AppCompatActivity() {
         handler.removeCallbacks(retryRunnable)
         isReconnecting = false
         currentRetryDelay = INITIAL_RETRY_DELAY_MS
+        restartEvents++
+        lastEvent = "reload"
         releasePlayer()
         initializePlayer()
     }
@@ -410,6 +494,7 @@ class PlaybackActivity : AppCompatActivity() {
         bufferingStartTime = 0L
         player?.let {
             it.removeListener(playerListener)
+            it.removeAnalyticsListener(analyticsListener)
             it.release()
         }
         player = null
@@ -512,10 +597,13 @@ class PlaybackActivity : AppCompatActivity() {
         val currentPosition = p.currentPosition
         val bufferedPosition = p.bufferedPosition
         if (bufferedPosition > 0 && currentPosition > 0) {
-            val behindLiveEdge = bufferedPosition - currentPosition
-            if (behindLiveEdge > MAX_DRIFT_THRESHOLD_MS) {
-                Log.w(TAG, "Drift ${behindLiveEdge}ms behind live edge, catching up")
-                p.seekTo(bufferedPosition - 1000)
+            val bufferedAhead = bufferedPosition - currentPosition
+            // Only step toward live when latency is truly excessive, and keep a
+            // healthy buffer so we don't immediately re-buffer. During normal
+            // operation this never fires, so the buffer is left to do its job.
+            if (bufferedAhead > LIVE_RESYNC_THRESHOLD_MS) {
+                Log.w(TAG, "Latency ${bufferedAhead}ms too high, trimming toward live (keeping ${RESYNC_KEEP_BUFFER_MS}ms)")
+                p.seekTo(bufferedPosition - RESYNC_KEEP_BUFFER_MS)
             }
         }
         if (kotlin.math.abs(p.playbackParameters.speed - 1.0f) > 0.01f) {
@@ -524,6 +612,81 @@ class PlaybackActivity : AppCompatActivity() {
     }
 
     // ---------------- Status UI (suppressed during playback) ----------------
+
+    // ---------------- Debug overlay ----------------
+
+    private fun toggleDebugOverlay() {
+        debugVisible = !debugVisible
+        if (debugVisible) {
+            debugText.visibility = View.VISIBLE
+            debugText.text = buildDebugText()
+            handler.removeCallbacks(debugRunnable)
+            handler.postDelayed(debugRunnable, 1000L)
+        } else {
+            debugText.visibility = View.GONE
+            handler.removeCallbacks(debugRunnable)
+        }
+    }
+
+    private fun buildDebugText(): String {
+        val p = player
+        val sb = StringBuilder()
+        sb.append("VeltrixTV v5.4  (D-pad Down to hide)\n")
+
+        if (p == null) {
+            sb.append("player: null\n")
+        } else {
+            val stateStr = when (p.playbackState) {
+                Player.STATE_IDLE -> "IDLE"
+                Player.STATE_BUFFERING -> "BUFFERING"
+                Player.STATE_READY -> "READY"
+                Player.STATE_ENDED -> "ENDED"
+                else -> "?"
+            }
+            val pos = p.currentPosition
+            val buffered = p.bufferedPosition
+            val ahead = buffered - pos
+            val minBuf = BASE_MIN_BUFFER_MS * bufferMultiplier
+            val maxBuf = BASE_MAX_BUFFER_MS * bufferMultiplier
+
+            sb.append("state: $stateStr  playing: ${p.isPlaying}  pWR: ${p.playWhenReady}\n")
+            sb.append("pos: ${pos}ms  buffered: ${buffered}ms\n")
+            sb.append("playback buffer (ahead of live-lag): ${ahead}ms\n")
+            sb.append("buffer target: ${minBuf}-${maxBuf}ms  x$bufferMultiplier\n")
+            sb.append("speed: ${p.playbackParameters.speed}\n")
+
+            val af = p.audioFormat
+            sb.append("audio in: ${af?.sampleMimeType ?: "-"} ")
+            sb.append("${af?.sampleRate ?: 0}Hz ${af?.channelCount ?: 0}ch\n")
+            sb.append("audio decoder: $audioDecoderName\n")
+
+            val vf = p.videoFormat
+            sb.append("video: ${vf?.width ?: 0}x${vf?.height ?: 0} ")
+            sb.append("${vf?.sampleMimeType ?: "-"} ${vf?.frameRate ?: 0f}fps\n")
+            sb.append("video decoder: $videoDecoderName\n")
+            sb.append("dropped frames: $droppedFrames  audio underruns: $audioUnderruns\n")
+
+            val err = p.playerError
+            if (err != null) sb.append("player error: ${err.errorCodeName}\n")
+        }
+
+        sb.append("events: buffering=$bufferingEvents reload=$restartEvents  last=$lastEvent\n")
+        sb.append("reconnect attempts: $retryAttempts\n")
+
+        val srt = SrtDataSource.latestStats
+        if (srt != null) {
+            sb.append("--- SRT ---\n")
+            sb.append("RTT: ${"%.1f".format(srt.rttMs)}ms  ")
+            sb.append("bw: ${"%.2f".format(srt.mbpsBandwidth)}Mbps  ")
+            sb.append("recv: ${"%.2f".format(srt.mbpsRecvRate)}Mbps\n")
+            sb.append("pkt loss: ${srt.pktRcvLoss}  retrans: ${srt.pktRcvRetrans}  ")
+            sb.append("drop: ${srt.pktRcvDrop}\n")
+            sb.append("pkts recv total: ${srt.pktRecvTotal}\n")
+        } else {
+            sb.append("--- SRT --- (no data yet)\n")
+        }
+        return sb.toString()
+    }
 
     private fun showConfigPrompt(message: String) {
         runOnUiThread {

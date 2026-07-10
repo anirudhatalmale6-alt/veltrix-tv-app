@@ -31,13 +31,33 @@ class SrtDataSource : BaseDataSource(true) {
         // and the player release/reconnect cleanly on a real outage.
         private const val PEER_IDLE_TIMEOUT_MS = 5000
 
-        private const val ENCRYPTED_PAYLOAD_KEY_LEN = 16
+        // Sample SRT stats roughly twice a second (~380 reads/s at typical
+        // bitrates) from the reader thread, so the UI can read a snapshot
+        // without ever touching the socket concurrently with recv().
+        private const val STATS_SAMPLE_EVERY_READS = 180
+
+        /** Latest SRT statistics snapshot, updated on the reader thread. */
+        @Volatile
+        var latestStats: SrtStatsSnapshot? = null
+            private set
     }
+
+    /** Immutable snapshot of the SRT socket's live statistics. */
+    data class SrtStatsSnapshot(
+        val rttMs: Double,
+        val mbpsBandwidth: Double,
+        val mbpsRecvRate: Double,
+        val pktRcvLoss: Int,
+        val pktRcvRetrans: Int,
+        val pktRcvDrop: Int,
+        val pktRecvTotal: Long
+    )
 
     private var socket: SrtSocket? = null
     private var currentUri: Uri? = null
     private var pendingData: ByteArray? = null
     private var pendingOffset: Int = 0
+    private var readCount: Int = 0
 
     override fun open(dataSpec: DataSpec): Long {
         transferInitializing(dataSpec)
@@ -115,6 +135,12 @@ class SrtDataSource : BaseDataSource(true) {
                 return C.RESULT_END_OF_INPUT
             }
 
+            // Sample SRT stats periodically on this (reader) thread only.
+            if (++readCount >= STATS_SAMPLE_EVERY_READS) {
+                readCount = 0
+                sampleStats(sock)
+            }
+
             val toCopy = minOf(received.size, length)
             System.arraycopy(received, 0, buffer, offset, toCopy)
             if (toCopy < received.size) {
@@ -140,6 +166,23 @@ class SrtDataSource : BaseDataSource(true) {
         transferEnded()
     }
 
+    private fun sampleStats(sock: SrtSocket) {
+        try {
+            val s = sock.bistats(false, true)
+            latestStats = SrtStatsSnapshot(
+                rttMs = s.msRTT,
+                mbpsBandwidth = s.mbpsBandwidth,
+                mbpsRecvRate = s.mbpsRecvRate,
+                pktRcvLoss = s.pktRcvLoss,
+                pktRcvRetrans = s.pktRcvRetrans,
+                pktRcvDrop = s.pktRcvDrop,
+                pktRecvTotal = s.pktRecvTotal
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Error sampling SRT stats: ${e.message}")
+        }
+    }
+
     private fun closeQuietly() {
         try {
             socket?.close()
@@ -147,6 +190,7 @@ class SrtDataSource : BaseDataSource(true) {
             Log.w(TAG, "Error closing SRT socket: ${e.message}")
         }
         socket = null
+        latestStats = null
     }
 
     class Factory : DataSource.Factory {
