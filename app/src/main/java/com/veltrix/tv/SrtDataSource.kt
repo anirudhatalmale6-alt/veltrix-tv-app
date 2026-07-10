@@ -24,7 +24,7 @@ class SrtDataSource : BaseDataSource(true) {
     companion object {
         private const val TAG = "SrtDataSource"
         private const val SRT_PAYLOAD_SIZE = 1316
-        private const val CONNECT_TIMEOUT_MS = 10000
+        private const val CONNECT_TIMEOUT_MS = 5000
         private const val RCVBUF_SIZE = 8388608
         // If the SRT peer goes silent for this long the connection is declared
         // dead and recv() fails - this is what lets the reader thread unblock

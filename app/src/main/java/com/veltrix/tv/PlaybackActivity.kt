@@ -1,16 +1,12 @@
 package com.veltrix.tv
 
-import android.app.AlarmManager
 import android.app.AlertDialog
-import android.app.PendingIntent
 import android.content.Context
-import android.content.Intent
 import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.Process
 import android.text.InputType
 import android.util.Log
 import android.view.KeyEvent
@@ -43,8 +39,9 @@ import java.io.InputStreamReader
  * (v3.2) build the client confirmed was reliable:
  *  - SRT playback via ExoPlayer + srtdroid custom data source
  *  - Foreground service + wake lock keep the process alive through outages
- *  - Reliable self-restart via AlarmManager (NOT Runtime.exit, which raced the
- *    relaunch and dumped the box to the launcher)
+ *  - The app NEVER kills itself: on any outage it keeps retrying the
+ *    reconnection in place forever (capped backoff), so it can never drop the
+ *    box to the launcher, and it resumes the instant the stream/internet returns
  *  - Simple main-thread player release, no force-close/background juggling
  *
  * Improvements added on top, as requested:
@@ -62,8 +59,7 @@ class PlaybackActivity : AppCompatActivity() {
         private const val DEFAULT_PIN = "000000"
 
         private const val INITIAL_RETRY_DELAY_MS = 2000L
-        private const val MAX_RETRY_DELAY_MS = 30000L
-        private const val MAX_RETRY_ATTEMPTS = 5
+        private const val MAX_RETRY_DELAY_MS = 10000L
         private const val WATCHDOG_INTERVAL_MS = 10000L
         private const val SYNC_CHECK_INTERVAL_MS = 30000L
         private const val MAX_BUFFERING_TIME_MS = 60000L
@@ -121,11 +117,17 @@ class PlaybackActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Safety net: if anything unexpected crashes, relaunch reliably via the
-        // AlarmManager path instead of dropping out to another launcher.
-        Thread.setDefaultUncaughtExceptionHandler { _, throwable ->
-            Log.e(TAG, "Uncaught exception, restarting: ${throwable.message}", throwable)
-            try { restartApp() } catch (_: Exception) {}
+        // Safety net: if a background thread throws (e.g. the SRT/ExoPlayer
+        // loader), recover the player IN PLACE. We never kill the process -
+        // on this box a process kill drops out to the launcher and doesn't
+        // come back, so staying alive and reconnecting is always better.
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            Log.e(TAG, "Uncaught on ${thread.name}: ${throwable.message}", throwable)
+            try {
+                handler.post {
+                    try { fullRestartPlayback() } catch (_: Exception) {}
+                }
+            } catch (_: Exception) {}
         }
 
         window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -332,18 +334,18 @@ class PlaybackActivity : AppCompatActivity() {
         val url = prefs.getString(KEY_STREAM_URL, "") ?: ""
         if (url.isBlank()) {
             showConfigPrompt("No stream configured. Press MENU or BACK to open settings.")
+            isReconnecting = false
             return
         }
 
         retryAttempts++
-        Log.i(TAG, "Retry attempt $retryAttempts of $MAX_RETRY_ATTEMPTS")
+        Log.i(TAG, "Reconnect attempt $retryAttempts (retrying indefinitely, delay=${currentRetryDelay}ms)")
 
-        if (retryAttempts >= MAX_RETRY_ATTEMPTS) {
-            Log.w(TAG, "Max retries reached - restarting app (AlarmManager)")
-            handler.postDelayed({ restartApp() }, 2000)
-            return
-        }
-
+        // IMPORTANT: never kill the app. On a long outage we keep retrying in
+        // place forever - the foreground service + wake lock keep us alive, and
+        // the moment the stream/internet returns the next retry just succeeds.
+        // (The old "restart the whole app after 5 tries" is what made the box
+        // drop to the launcher and never come back.)
         handler.postDelayed(retryRunnable, currentRetryDelay)
         currentRetryDelay = (currentRetryDelay * 2).coerceAtMost(MAX_RETRY_DELAY_MS)
     }
@@ -365,32 +367,6 @@ class PlaybackActivity : AppCompatActivity() {
             it.release()
         }
         player = null
-    }
-
-    /**
-     * Reliable self-restart. The relaunch is scheduled with AlarmManager BEFORE
-     * the process is killed, so the OS brings the app back even on TV boxes.
-     * This is the key fix for the "exits to launcher and never resumes" bug -
-     * the old code used Runtime.exit() which raced the relaunch.
-     */
-    private fun restartApp() {
-        Log.i(TAG, "Performing full app restart via AlarmManager")
-        try {
-            val intent = packageManager.getLaunchIntentForPackage(packageName)
-            intent?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
-            val pending = PendingIntent.getActivity(
-                this, 0, intent,
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_CANCEL_CURRENT
-            )
-            val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            am.set(AlarmManager.RTC, System.currentTimeMillis() + 500, pending)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to schedule restart: ${e.message}", e)
-        }
-        releasePlayer()
-        PlaybackService.stop(this)
-        finishAffinity()
-        Process.killProcess(Process.myPid())
     }
 
     // ---------------- Watchdog & sync ----------------
